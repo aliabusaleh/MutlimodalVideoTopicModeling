@@ -394,6 +394,7 @@ def _run_video_pipeline(
         if visual_vectors is None:
             visual_vectors = np.load(processed_dir / "visual_embeddings.npy")
 
+        # TODO -  gated fusion
         fused = similarity_gated_concatenation(
             audio_vectors,
             visual_vectors,
@@ -426,6 +427,7 @@ def _run_video_pipeline(
 
         multimodal_embeddings = None
         tv_concat = ta_concat = tav_concat = None
+        # TODO - Attention model
         if topic_embedding_source in {"multimodal", "coattention", "co_attention", "both"}:
             audio_vectors = np.load(processed_dir / "audio_embeddings.npy")
             if visual_vectors is None:
