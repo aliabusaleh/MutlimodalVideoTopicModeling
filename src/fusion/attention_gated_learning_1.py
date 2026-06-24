@@ -46,16 +46,17 @@ class SelfAttention(nn.Module):
    """
     def __init__(self, num_heads, embed_dims):
         super(SelfAttention, self).__init__()
+        print(f"num Heads: {num_heads}, embe dims: {embed_dims}")
         self.attention = nn.MultiheadAttention(
-            num_heads,
-            embed_dims,
-            drouput=0.1,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=0.1,
             batch_first=True
         )
 
-        self.norm1 = nn.LayerNorm(embed_dims)
+        self.norm1 = AddNorm(embed_dims)
         self.linear = nn.Linear(embed_dims, embed_dims)
-        self.norm2 = nn.LayerNorm(embed_dims)
+        self.norm2 = AddNorm(embed_dims)
 
     def forward(self, i):
         x, attention_weights = self.attention(i, i, i)
@@ -110,7 +111,7 @@ class MultiModalCoAttention(nn.Module):
     def __init__(self, heads, embed_dims,  dropout: float = 0.1):
         super().__init__()
         self.modality_blocks = nn.ModuleList([ModalityBlock(heads, embed_dims, dropout) for _ in range(3)])
-        self.co_attention = nn.ModuleList([CoAttention(heads, dropout)for _ in range(3)])
+        self.co_attention = nn.ModuleList([CoAttention(heads, embed_dims)for _ in range(3)])
         self.add_norm = nn.ModuleList([AddNorm(embed_dims, dropout) for _ in range(3)])
 
     # change forward function to account for not just stacking up the inputs
@@ -127,19 +128,19 @@ class MultiModalCoAttention(nn.Module):
         # Triangle Scheme with kv, combined from both other modalities
         # Q: t - KV: av
         av_kv = torch.cat([a,v], dim=1)
-        t_attended = CoAttention(ff_t, av_kv)
+        t_attended, _ = self.co_attention[0](t, av_kv)
         # Q: a - KV: tv
         tv_kv = torch.cat([t,v], dim=1)
-        a_attended = CoAttention(ff_a, tv_kv)
+        a_attended, _ = self.co_attention[1](a, tv_kv)
         # Q: v - KV: at
         ta_kv = torch.cat([a,t], dim=1)
-        v_attended = CoAttention(ff_v, at_kv)
+        v_attended, _ = self.co_attention[2](v, ta_kv)
 
 
         # 5. AddNorm
-        t_output = self.add_norm[0](ff_t, t_attended)
-        a_output = self.add_norm[1](ff_a, a_attended)
-        v_output = self.add_norm[2](ff_v, v_attended)
+        t_output = self.add_norm[0](t, t_attended)
+        a_output = self.add_norm[1](a, a_attended)
+        v_output = self.add_norm[2](v, v_attended)
 
         return t_output, a_output, v_output
 
@@ -150,7 +151,7 @@ class CrossAttention(nn.Module):
 
 
 if __name__ == '__main__':
-    # dummy data - make up reasonable shapes
+    # dummy data
     batch_size = 2
     text_len = 20
     audio_len = 50
@@ -163,10 +164,21 @@ if __name__ == '__main__':
 
     # instantiate
     model = MultiModalCoAttention(heads=8, embed_dims=embed_dim)
+    for name, param in model.named_parameters():
+        print(name, param.requires_grad)
+
 
     # forward pass
     t_out, a_out, v_out = model(text, audio, video)
 
+    loss = t_out.sum() + a_out.sum() + v_out.sum()
+    loss.backward()
+    print("backward passed!")
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            print(f"NO GRAD: {name}")
+        else:
+            print(f"OK: {name}")
     print(t_out.shape)  # should be (2, 20, 512)
     print(a_out.shape)  # should be (2, 50, 512)
     print(v_out.shape)  # should be (2, 100, 512)
