@@ -1,127 +1,237 @@
+import traceback
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from src.fusion.co_sim_gated import _align_to_common_dim
+
 """
+Approach inspired by a combination from:
 https://arturmagalhaes.com/research/python/2025/10/23/attention-mechanisms.html
-
 https://github.com/nestor-sun/mcoattention
-"""
-class CoAttentionLayer(nn.Module):
-    """
-    3 Modalities as "triangle" with undirected edges:
-        => compute attention in any direction between the modalities simultaneously with coupled parameters
 
-    Co-Attention:
-        Modality A uses its own Q, but attends to the other modalities K.
-        "Coupled" as: each modalities K and V serves as Context for the other modalities Q.
+Adjusted into an approach that actually separates Q and KV instead of stacking them
+"""
+
+
+
+class AddNorm(nn.Module):
     """
-    def __init__(
-            self,
-            embed_dim: int,
-            number_heads: int = 12 # TODO Adjust this if needed
-    ):
+    taken from:
+        https://github.com/nestor-sun/mcoattention/transformer_layer.py
+
+    """
+    def __init__(self, embed_dims, dropout=0.1):
+        super(AddNorm, self).__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(embed_dims)
+
+    def forward(self, x_old, x_new):
+        return self.norm(self.dropout(x_new) + x_old)
+
+
+class FeedForwardNetwork(nn.Module):
+    def __init__(self, embed_dims):
         super().__init__()
-        self.norm = nn.LayerNorm(embed_dim)
         self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
+            nn.Linear(embed_dims, embed_dims* 4),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(embed_dim * 4, embed_dim)
+            nn.Linear(embed_dims * 4, embed_dims)
         )
-        self.norm2 = nn.LayerNorm(embed_dim)
-
-        self.num_heads = number_heads
-        self.head_dim = embed_dim // number_heads
-        self.scale = self.head_dim ** -0.5 # scale down the scores for the soft max function
+        self.norm = nn.LayerNorm(embed_dims)
+    def forward(self, x):
+        return self.norm(self.ffn(x))
 
 
-        # seperate Q, and combined KV for each modality
+class SelfAttention(nn.Module):
+    """
+    Inspired from:
+       https://github.com/nestor-sun/mcoattention/transformer_layer.py
+   """
+    def __init__(self, num_heads, embed_dims):
+        super(SelfAttention, self).__init__()
+        self.attention = nn.MultiheadAttention(
+            embed_dim=embed_dims,
+            num_heads=num_heads,
+            dropout=0.1,
+            batch_first=True
+        )
 
-        self.text_q = nn.Linear(embed_dim, embed_dim)
-        self.audio_q = nn.Linear(embed_dim, embed_dim)
-        self.video_q = nn.Linear(embed_dim, embed_dim)
+        self.norm1 = AddNorm(embed_dims)
+        self.linear = nn.Linear(embed_dims, embed_dims)
+        self.norm2 = AddNorm(embed_dims)
 
-        self.text_kv = nn.Linear(embed_dim, embed_dim*2)
-        self.audio_kv = nn.Linear(embed_dim, embed_dim *2)
-        self.video_kv = nn.Linear(embed_dim, embed_dim*2)
-
-        self.text_out = nn.Linear(embed_dim, embed_dim)
-        self.audio_out = nn.Linear(embed_dim, embed_dim)
-        self.video_out = nn.Linear(embed_dim, embed_dim)
-
-        self.dropout = nn.Dropout(0.1)
-
-    def forward(self, text_features, audio_features, video_features):
-        batch_size = text_features.shape[0]
-        text_len = text_features.shape[1]
-        audio_len = audio_features.shape[1]
-        video_len = video_features.shape[1]
-
-        # 1. features
-        text_q = self.text_q(text_features).view(batch_size, text_len, self.num_heads, self.head_dim).transpose(1, 2)
-        text_k, text_v = self.text_kv(text_features).chunk(2, dim=-1)
-        text_k = text_k.view(batch_size, text_len, self.num_heads, self.head_dim).transpose(1, 2)
-        text_v = text_v.view(batch_size, text_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-        audio_q = self.audio_q(audio_features).view(batch_size, audio_len, self.num_heads, self.head_dim).transpose(1, 2)
-        audio_k, audio_v = self.audio_kv(audio_features).chunk(2, dim=-1)
-        audio_k = audio_k.view(batch_size, audio_len, self.num_heads, self.head_dim).transpose(1, 2)
-        audio_v = audio_v.view(batch_size, audio_len, self.num_heads, self.head_dim).transpose(1, 2)
+    def forward(self, i):
+        x, attention_weights = self.attention(i, i, i)
+        x_norm = self.norm1(i, x)
+        x_linear = self.linear(x_norm)
+        x_normed = self.norm2(x_norm, x_linear)
+        return x_normed, attention_weights
 
 
-        video_q = self.video_q(video_features).view(batch_size, video_len, self.num_heads, self.head_dim).transpose(1, 2)
-        video_k, video_v = self.video_kv(video_features).chunk(2, dim=-1)
-        video_k = video_k.view(batch_size, video_len, self.num_heads, self.head_dim).transpose(1, 2)
-        video_v = video_v.view(batch_size, video_len, self.num_heads, self.head_dim).transpose(1, 2)
+class ModalityBlock(nn.Module):
+    def __init__(self, num_heads, embed_dims, dropout: float = 0.1):
+        super().__init__()
+        self.self_attentions = SelfAttention(num_heads, embed_dims)
+        self.ffns = FeedForwardNetwork(embed_dims)
+        self.norms = AddNorm(embed_dims, dropout)
+    def forward(self, input):
+        # 1. self Attention
+        x, _ = self.self_attentions(input)
 
-        # co attention 3 way system (like a triangle)
-        # a<->t , v<->t, a<->v
-        t_to_a_scores = torch.matmul(text_q, audio_k.transpose(-2, -1)) * self.scale
-        a_to_t_scores = torch.matmul(audio_q, text_k.transpose(-2, -1)) * self.scale
+        # 2.  AddNorm
+        x_normed = self.norms(input, x)
 
-        v_to_t_scores = torch.matmul(video_q, text_k.transpose(-2, -1)) * self.scale
-        t_to_v_scores = torch.matmul(text_q, video_k.transpose(-2, -1)) * self.scale
+        # 3. ffn
+        x_ffn = self.ffns(x_normed)
 
-        a_to_v_scores = torch.matmul(audio_q, video_k.transpose(-2, -1)) * self.scale
-        v_to_a_scores = torch.matmul(video_q, audio_k.transpose(-2, -1)) * self.scale
+        return x_ffn
 
-        # 2. attention (and dropout)
-        t_to_a_attn_weights = self.dropout(F.softmax(t_to_a_scores, dim=-1))
-        a_to_t_attn_weights = self.dropout(F.softmax(a_to_t_scores, dim=-1))
 
-        v_to_t_attn_weights = self.dropout(F.softmax(v_to_t_scores, dim=-1))
-        t_to_v_attn_weights = self.dropout(F.softmax(t_to_v_scores, dim=-1))
+# ================ CO ATTENTION ===========================
+class CoAttention(nn.Module):
+    def __init__(self, num_heads, embed_dims):
+        super().__init__()
 
-        a_to_v_attn_weights = self.dropout(F.softmax(a_to_v_scores, dim=-1))
-        v_to_a_attn_weights = self.dropout(F.softmax(v_to_a_scores, dim=-1))
+        self.attention = nn.MultiheadAttention(
+            embed_dim=embed_dims,
+            num_heads=num_heads,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.norm = nn.LayerNorm(embed_dims)
 
-        # attend as weighted sum of the other modalities
-        t_attended = torch.matmul(t_to_a_attn_weights, audio_v) + torch.matmul(t_to_v_attn_weights, video_v)
-        a_attended = torch.matmul(a_to_v_attn_weights, video_v) + torch.matmul(a_to_t_attn_weights, text_v)
-        v_attended = torch.matmul(v_to_a_attn_weights, audio_v) + torch.matmul(v_to_t_attn_weights, text_v)
 
-        t_attended = t_attended.transpose(1, 2).contiguous().view(batch_size, text_len, -1)
-        a_attended = a_attended.transpose(1, 2).contiguous().view(batch_size, audio_len, -1)
-        v_attended = v_attended.transpose(1, 2).contiguous().view(batch_size, video_len, -1)
+    def forward(self, query, key_value):
+        attn_output, attn_weights = self.attention(query, key_value, key_value)
+        query = self.norm(query + attn_output)
+        return query, attn_weights
 
-        # 3. add original features and normalize
-        t = self.norm(t_attended + text_features)
-        a = self.norm(a_attended + audio_features)
-        v = self.norm(v_attended + video_features)
 
-        # 4. normalize
-        t = self.norm(t)
-        a = self.norm(a)
-        v = self.norm(v)
+class MultiModalCoAttention(nn.Module):
+    """
+    """
+    def __init__(self, heads,  dropout: float = 0.1):
+        super().__init__()
+        self.heads = heads
+        self.dropout = dropout
+        self._initialized = False
+        
+    def _build(self, embed_dims):
+        self.embed_dims = 512
+        self.modality_blocks = nn.ModuleList([ModalityBlock(self.heads, embed_dims, self.dropout) for _ in range(3)])
+        self.co_attention = nn.ModuleList([CoAttention(self.heads, embed_dims)for _ in range(3)])
+        self.add_norm = nn.ModuleList([AddNorm(embed_dims, self.dropout) for _ in range(3)])
+        
 
-        # 5. FFN
+        # learned fusion layer
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(3 * embed_dims, 2 * embed_dims),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(2 * embed_dims, embed_dims)
+        )
+        self._initialized = True
 
-        # 6. add
 
-        # 7. normalize
+    # change forward function to account for not just stacking up the inputs
+    def forward(self, text, audio, video):
+        #text, audio, video = _align_to_common_dim(text, audio, video)
+        try:
+            if not self._initialized:
 
-        # 8. output
-        text_output = self.text_out(t_attended)
-        audio_output = self.audio_out(a_attended)
-        video_output = self.video_out(v_attended)
+                self._build(text.shape[-1])
+            print("after initialize in forward")
+            print(text.shape, audio.shape, video.shape)  # all should match
 
-        return text_output, audio_output, video_output
+            # modality separated steps 1 through 3 (SelfAttention):
+            text = text.unsqueeze(1)
+            audio = audio.unsqueeze(1)
+            video = video.unsqueeze(1)
+            print("after unsqueeze")
+            print(text.shape, audio.shape, video.shape)  # all should match
+
+            t = self.modality_blocks[0](text)
+            a = self.modality_blocks[1](audio)
+            v = self.modality_blocks[2](video)
+
+            # 4.  Co-Attention
+
+            # Triangle Scheme with kv, combined from both other modalities
+            # Q: t - KV: av
+            av_kv = torch.cat([a,v], dim=1)
+            t_attended, _ = self.co_attention[0](t, av_kv)
+            # Q: a - KV: tv
+            tv_kv = torch.cat([t,v], dim=1)
+            a_attended, _ = self.co_attention[1](a, tv_kv)
+            # Q: v - KV: at
+            ta_kv = torch.cat([a,t], dim=1)
+            v_attended, _ = self.co_attention[2](v, ta_kv)
+
+
+            # 5. AddNorm
+            t_output = self.add_norm[0](t, t_attended)
+            a_output = self.add_norm[1](a, a_attended)
+            v_output = self.add_norm[2](v, v_attended)
+
+            fused = torch.cat(
+            [t_output,
+             a_output,
+             v_output],
+            dim=-1
+            )
+
+            print(t_output.shape, a_output.shape, v_output.shape)
+            print(t_output.mean(dim=1).shape)
+            print(fused.shape)
+            fusion = self.fusion_mlp(fused)
+
+            return fusion.squeeze(1)
+        except Exception:
+            traceback.print_exc()
+
+
+# ====== CROSS ATTENTION ==============
+
+# TODO
+
+class CrossAttention(nn.Module):
+    pass
+
+def contrastive_loss(embeddings, temperature=0.07):
+    """
+    NT xent contrastive loss, for positive pairs (same image, text and audio) and negative pairs
+    :param embeddings:
+    :param temperature:
+    :return:
+    """
+    embeddings = F.normalize(embeddings, dim=-1)
+    # making a similarity matrix
+    sim_matrix = embeddings @ embeddings.T / temperature
+    # diagonal: each video embeds compared with embeddings from same video
+    # non-fiagonal: compared to a different video
+    labels = torch.arange(sim_matrix.size(0), device=embeddings.device)
+
+    #cross entropy loss
+    loss = F.cross_entropy(sim_matrix, labels)
+    return loss
+
+def run(text_vectors, audio_vectors, video_vectors, epochs=10, heads=8):
+    try:
+        model = MultiModalCoAttention(heads=heads)
+        #print(text_vectors.shape, audio_vectors.shape, video_vectors.shape)
+        #print(text_vectors[:1].shape, audio_vectors[:1].shape, video_vectors[:1].shape)
+        dummy = model(text_vectors[:1], audio_vectors[:1], video_vectors[:1])
+
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            fused = model(text_vectors, audio_vectors, video_vectors)
+            contrast_loss = contrastive_loss(fused)
+            contrast_loss.backward()
+            optimizer.step()
+        return model
+    except Exception:
+        traceback.print_exc()
+

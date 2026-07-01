@@ -6,16 +6,18 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 
 from src.asr.whisper_transcribe import transcribe_with_whisper
 from src.audio.speaker_embeddings import embed_segments
 from src.clustering.cluster import run_umap_hdbscan
 from src.config import ensure_dir, load_config
 from src.evaluation.metrics import compute_numeric_metrics
+from src.fusion.attention_gated_learning import MultiModalCoAttention, run
 from src.fusion.co_sim_gated import (
     similarity_gated_concatenation,
     similarity_gated_concatenation_multimodal,
-    naive_concatenation,
+    naive_concatenation, _align_to_common_dim,
 )
 from src.preprocess.audio_extractor import extract_wav
 from src.topic.bertopic_runner import encode_text_segments, run_bertopic
@@ -438,14 +440,36 @@ def _run_video_pipeline(
                 device=str(cfg.get("topic", "sentence_model_device", default="cuda")),
                 show_progress=True,
             )
-            multimodal_embeddings = similarity_gated_concatenation_multimodal(
-                text_vectors=text_vectors,
-                audio_vectors=audio_vectors,
-                visual_vectors=visual_vectors,
-                weight_text=float(cfg.get("topic", "weight_text", default=0.34)),
-                weight_audio=float(cfg.get("topic", "weight_audio", default=0.33)),
-                weight_visual=float(cfg.get("topic", "weight_visual", default=0.33)),
-            )
+
+            # multimodal_embeddings = similarity_gated_concatenation_multimodal(
+            #     text_vectors=text_vectors,
+            #     audio_vectors=audio_vectors,
+            #     visual_vectors=visual_vectors,
+            #     weight_text=float(cfg.get("topic", "weight_text", default=0.34)),
+            #     weight_audio=float(cfg.get("topic", "weight_audio", default=0.33)),
+            #     weight_visual=float(cfg.get("topic", "weight_visual", default=0.33)),
+            # )
+
+
+            print("using the new co attention implementation ")
+            text_vectors, audio_vectors, visual_vectors = _align_to_common_dim(text_vectors, audio_vectors,
+                                                                              visual_vectors)
+
+            # model needs torch tensors no np arrays
+            text_vectors = torch.tensor(text_vectors, dtype=torch.float32)
+            audio_vectors = torch.tensor(audio_vectors, dtype=torch.float32)
+            visual_vectors = torch.tensor(visual_vectors, dtype=torch.float32)
+            print("in the run: ")
+            print(text_vectors.shape, audio_vectors.shape, visual_vectors.shape)  # all should match
+
+
+            # initiate model and self supervised training
+            model = run(text_vectors, audio_vectors, visual_vectors)
+
+            multimodal_embeddings = model(text_vectors, audio_vectors, visual_vectors)
+            multimodal_embeddings = multimodal_embeddings.detach().numpy()
+
+
             save_numpy(processed_dir / "multimodal_topic_embeddings.npy", multimodal_embeddings)
 
             # Baseline: simple L2-normalized concatenations (no gate, no interactions)

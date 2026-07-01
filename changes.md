@@ -29,3 +29,8 @@
    - Q from Self Attention 
    - KV from the "next" modality
 5. Add and Norm (FFN and Cross Attention )
+
+
+
+
+improvement. : doesmt nt need to be brought so asame dims
