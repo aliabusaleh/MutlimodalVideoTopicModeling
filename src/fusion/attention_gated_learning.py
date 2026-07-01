@@ -199,6 +199,84 @@ class MultiModalCoAttention(nn.Module):
 class CrossAttention(nn.Module):
     pass
 
+
+
+class MultiModalCrossAttention(nn.Module):
+    """
+    use one of the modalities as anchor
+
+
+    A) first test on text as baseline
+
+    B) second test on video as baseline
+
+    maybe can use the existen COAttention class to implement it too? then just rename, and pass inputs accordingluy
+
+    sweitch based on parameter
+
+
+    Q       KV
+    text -> Video
+    text -> audio
+
+    ----
+    Q       KV
+    video -> audio
+    video -> text
+    """
+    def __init__(self, heads, dropout, baseline):
+        super().__init__()
+        self.heads = heads
+        self.dropout = dropout
+        self.baseline = baseline
+        self._initialized = False
+
+    def _build(self, embed_dims):
+        self.modality_blocks = nn.ModuleList([ModalityBlock(self.heads, embed_dims, self.dropout) for _ in range(3)])
+        self.cross_attention = nn.ModuleList([CrossAttention(self.heads, embed_dims) for _ in range(3)])
+        self.add_norm = nn.ModuleList([AddNorm(embed_dims, self.dropout) for _ in range(3)])
+        # learned fusion layer
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(3 * embed_dims, 2 * embed_dims),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(2 * embed_dims, embed_dims)
+        )
+        self._initialized = True
+
+    def forward(self, text, audio, video):
+        # modality block same as coattention
+        try:
+            if not self._initialized:
+                self._build(text.shape[-1])
+
+                # modality separated steps 1 through 3 (SelfAttention):
+                text = text.unsqueeze(1)
+                audio = audio.unsqueeze(1)
+                video = video.unsqueeze(1)
+                t = self.modality_blocks[0](text)
+                a = self.modality_blocks[1](audio)
+                v = self.modality_blocks[2](video)
+
+                # 4. Cross Attention, dependent on baseline
+                kv_v = torch.cat([v, v], dim=1)
+                kv_a = torch.cat([a, a], dim=1)
+                kv_t = torch.cat([t, t], dim=1)
+
+                if self.baseline == "text":
+                    # t -> v; t -> a
+                    #todo does this work with itself??
+                    t_v_attended, _ = self.cross_attention[0](t, kv_v)
+                    t_a_attended, _ = self.cross_attention[0](t, kv_a)
+                elif self.baseline == "video":
+                    pass
+                 #todo continue here
+                
+
+        except Exception:
+            traceback.print_exc()
+    pass
+
 def contrastive_loss(embeddings, temperature=0.07):
     """
     NT xent contrastive loss, for positive pairs (same image, text and audio) and negative pairs
@@ -210,7 +288,7 @@ def contrastive_loss(embeddings, temperature=0.07):
     # making a similarity matrix
     sim_matrix = embeddings @ embeddings.T / temperature
     # diagonal: each video embeds compared with embeddings from same video
-    # non-fiagonal: compared to a different video
+    # non-diagonal: compared to a different video
     labels = torch.arange(sim_matrix.size(0), device=embeddings.device)
 
     #cross entropy loss
