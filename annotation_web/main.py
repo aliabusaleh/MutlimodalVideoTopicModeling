@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 # --- Paths ---
 BASE_DIR = Path(__file__).resolve().parent
-BASE_DIR_data = Path("/home/staff_homes/aabusale/desk/video_topic_modeling/")
+BASE_DIR_data = Path("/home/staff_homes/sittardt/projects/MultimodalVideoTopicModelling/")
 DATA_ROOT = BASE_DIR_data / "data"
 ANNOTATION_ROOT = BASE_DIR_data / "data" / "output" / "annotation" / "cross_video"
 DB_PATH = BASE_DIR_data / "data" / "annotation.sqlite3"
@@ -47,6 +47,11 @@ def from_iso(value: str | None) -> datetime | None:
 
 def rel_file_url(path: str | Path) -> str:
     file_path = Path(path)
+
+    print(f"DEBUG input: {file_path}")
+    print(f"DEBUG DATA_ROOT: {DATA_ROOT}")
+
+
     if str(file_path).startswith("/data/"):
         file_path = DATA_ROOT / file_path.relative_to("/data")
     elif str(file_path).startswith("/files/"):

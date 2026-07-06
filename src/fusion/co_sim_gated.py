@@ -9,7 +9,7 @@ def _align_to_common_dim(*arrays: np.ndarray) -> list[np.ndarray]:
     min_dim = min(arr.shape[1] for arr in arrays)
     return [arr[:, :min_dim] for arr in arrays]
 
-
+#TODO - weights
 def similarity_gated_concatenation(
     audio_vectors: np.ndarray,
     visual_vectors: np.ndarray,
@@ -34,12 +34,12 @@ def similarity_gated_concatenation(
     fused = np.concatenate([a_weighted, v_weighted, interaction], axis=1)
     return l2_normalize(fused)
 
-
+# TODO - weights
 def similarity_gated_concatenation_multimodal(
     text_vectors: np.ndarray,
     audio_vectors: np.ndarray,
     visual_vectors: np.ndarray,
-    weight_text: float = 0.34,
+    weight_text: float = 0.34, 
     weight_audio: float = 0.33,
     weight_visual: float = 0.33,
 ) -> np.ndarray:
